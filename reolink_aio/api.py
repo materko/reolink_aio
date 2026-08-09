@@ -475,6 +475,18 @@ class Host:
         return not self.sw_version_object >= self.sw_version_required  # pylint: disable=unneeded-not
 
     @property
+    def firmware_v2(self) -> bool:
+        """Check if the host runs a 2.x firmware, which needs several workarounds
+
+        A "Search" request may not span two calendar months, RTMP accepts token authentication only,
+        and NVR recordings are served over plain RTMP instead of the FLV wrapper or the Playback command.
+        """
+        if self.sw_version_object.is_unknown:
+            return False
+
+        return self.sw_version_object.major < 3
+
+    @property
     def model(self) -> str:
         return self.camera_model(None)
 
@@ -3407,7 +3419,8 @@ class Host:
             stream_type = 1
         else:
             stream_type = 0
-        if self._rtmp_auth_method == DEFAULT_RTMP_AUTH_METHOD:
+        # Firmware 2.x refuses user/password over RTMP (the connection fails with an I/O error) and accepts the login token only
+        if self._rtmp_auth_method == DEFAULT_RTMP_AUTH_METHOD and not self.firmware_v2:
             # RTMP needs unencoded password
             return (
                 f"rtmp://{self._host}:{self._rtmp_port}/bcs/"
@@ -3593,7 +3606,7 @@ class Host:
         if stream is None:
             stream = self._stream
 
-        if self._is_nvr and request_type in [VodRequestType.RTMP]:
+        if self._is_nvr and request_type in [VodRequestType.RTMP] and not self.firmware_v2:
             _LOGGER.warning("get_vod_source: NVRs do not yet support '%s' vod requests, using FLV instead", request_type.value)
             request_type = VodRequestType.FLV
 
@@ -3608,9 +3621,13 @@ class Host:
 
         if request_type in [VodRequestType.FLV, VodRequestType.RTMP]:
             mime = "application/x-mpegURL"
-            # Looks like it only works with login/password method, not with token
-            # RTMP and FLV need unencoded password
-            credentials = f"&user={self._username}&password={self._password}"
+            if self.firmware_v2:
+                # Firmware 2.x refuses user/password over RTMP and accepts the login token only
+                credentials = f"&token={self._token}"
+            else:
+                # Looks like it only works with login/password method, not with token
+                # RTMP and FLV need unencoded password
+                credentials = f"&user={self._username}&password={self._password}"
         else:
             mime = "video/mp4"
             credentials = f"&token={self._token}"
@@ -3627,7 +3644,14 @@ class Host:
             if self._rtmp_enabled is False:
                 await self.set_net_port(enable_rtmp=True)
 
-            url = f"rtmp://{self._host}:{self._rtmp_port}/vod/{filename.replace('/', '%20')}?channel={channel}&stream={stream_type}"
+            if self._is_nvr:
+                # Firmware 2.x NVRs serve no FLV wrapper (404) and no Playback command ("not support"),
+                # their own web interface plays recordings over plain RTMP instead.
+                # "start" is the recording's PlaybackTime formatted as YYYYMMDDHHMMSS,
+                # "seek" is an offset in seconds into that recording.
+                url = f"rtmp://{self._host}:{self._rtmp_port}/bcs/playback.bcs?channel={channel}&type={stream_type}&start={filename}&seek=0"
+            else:
+                url = f"rtmp://{self._host}:{self._rtmp_port}/vod/{filename.replace('/', '%20')}?channel={channel}&stream={stream_type}"
         elif request_type == VodRequestType.FLV:
             if self._use_https:
                 http_s = "https"
@@ -5862,11 +5886,16 @@ class Host:
         times = [(start, end)]
         if status_only:
             times = []
+            # A search reports the day-status table of every calendar month its range touches, so starting the
+            # range 5 minutes before the 1st reaches into the previous month and covers two months per request.
+            # Firmware 2.x rejects a range spanning two months with "get config failed" (rspCode -12),
+            # so there the range is kept inside a single month and one request per month is issued.
+            months_per_request = 1 if self.firmware_v2 else 2
             end_month = end.month + (end.year - start.year) * 12
-            for month_year in range(end_month, start.month - 1, -2):
+            for month_year in range(end_month, start.month - 1, -months_per_request):
                 month = int((month_year - 0.5) % 12 + 0.5)
                 year = start.year + int((month_year - 0.5) / 12)
-                if month_year > start.month:
+                if month_year > start.month and months_per_request == 2:
                     start_month = start.replace(year=year, month=month, day=1, hour=0, minute=0) - timedelta(minutes=5)
                 else:
                     start_month = start.replace(year=year, month=month, day=1, hour=0, minute=0)
