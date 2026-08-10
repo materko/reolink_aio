@@ -3595,8 +3595,14 @@ class Host:
         filename: str,
         stream: Optional[str] = None,
         request_type: VodRequestType = VodRequestType.FLV,
+        seek: int = 0,
     ) -> tuple[str, str]:
-        """Return the VOD source url."""
+        """Return the VOD source url.
+
+        seek starts playback that many seconds into the recording, which is how a
+        moment in the middle of a long recording is reached. Ignored by request
+        types that hand the file to the playback proxy instead of streaming it.
+        """
         if channel not in self._stream_channels:
             raise InvalidParameterError(f"get_vod_source: no camera connected to channel '{channel}'")
 
@@ -3649,7 +3655,7 @@ class Host:
                 # their own web interface plays recordings over plain RTMP instead.
                 # "start" is the recording's PlaybackTime formatted as YYYYMMDDHHMMSS,
                 # "seek" is an offset in seconds into that recording.
-                url = f"rtmp://{self._host}:{self._rtmp_port}/bcs/playback.bcs?channel={channel}&type={stream_type}&start={filename}&seek=0"
+                url = f"rtmp://{self._host}:{self._rtmp_port}/bcs/playback.bcs?channel={channel}&type={stream_type}&start={filename}&seek={seek}"
             else:
                 url = f"rtmp://{self._host}:{self._rtmp_port}/vod/{filename.replace('/', '%20')}?channel={channel}&stream={stream_type}"
         elif request_type == VodRequestType.FLV:
@@ -3659,7 +3665,7 @@ class Host:
                 http_s = "http"
 
             # seek = start x seconds into the file
-            url = f"{http_s}://{self._host}:{self._port}/flv?port={self._rtmp_port}&app=bcs&stream=playback.bcs&channel={channel}&type={stream_type}&start={filename}&seek=0"
+            url = f"{http_s}://{self._host}:{self._port}/flv?port={self._rtmp_port}&app=bcs&stream=playback.bcs&channel={channel}&type={stream_type}&start={filename}&seek={seek}"
         elif request_type in {VodRequestType.PLAYBACK, VodRequestType.DOWNLOAD, VodRequestType.NVR_DOWNLOAD}:
             start_time = ""
             time_start = ""
