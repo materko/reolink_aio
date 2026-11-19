@@ -1,15 +1,15 @@
 """Reolink Baichuan constants and utility functions"""
 
-import asyncio
 import logging
 from collections.abc import Callable
+from datetime import datetime
 from enum import Enum
 from hashlib import md5
 from itertools import cycle
 from typing import Any, TypeVar, overload
 from xml.etree import ElementTree as XML
 
-from ..exceptions import InvalidParameterError, UnexpectedDataError
+from ..exceptions import InvalidParameterError
 
 DEFAULT_BC_PORT = 9000
 HEADER_MAGIC = "f0debc0a"
@@ -180,43 +180,26 @@ def get_keys_from_xml(xml: str | XML.Element, keys: list[str] | dict[str, tuple[
     return result
 
 
-async def _i_frame_to_jpeg_shielded(frame: bytes, ffmpeg: str) -> bytes:
-    """Convert a i-frame from a Reolink stream to a JPEG image"""
-    command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", "pipe:0", "-f", "image2", "pipe:1"]
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+def xml_time_range(start: datetime, end: datetime) -> str:
+    """Generate the startTime and endTime XML block for a baichuan request"""
+    return (
+        f"<startTime>\n"
+        f"<year>{start.year}</year>\n"
+        f"<month>{start.month}</month>\n"
+        f"<day>{start.day}</day>\n"
+        f"<hour>{start.hour}</hour>\n"
+        f"<minute>{start.minute}</minute>\n"
+        f"<second>{start.second}</second>\n"
+        f"</startTime>\n"
+        f"<endTime>\n"
+        f"<year>{end.year}</year>\n"
+        f"<month>{end.month}</month>\n"
+        f"<day>{end.day}</day>\n"
+        f"<hour>{end.hour}</hour>\n"
+        f"<minute>{end.minute}</minute>\n"
+        f"<second>{end.second}</second>\n"
+        f"</endTime>"
     )
-
-    # feed in the frame
-    assert process.stdin
-    try:
-        process.stdin.write(frame)
-        await process.stdin.drain()
-    finally:
-        if process.stdin:
-            process.stdin.close()
-
-    # read out the image
-    assert process.stdout
-    try:
-        image = await process.stdout.read()
-    finally:
-        # Wait for process termination and check for errors.
-        retcode = await process.wait()
-        if retcode != 0:
-            assert process.stderr
-            stderr_data = await process.stderr.read()
-            raise UnexpectedDataError(f"Unexpected error while converting Reolink frame to JPEG image using ffmpeg: {stderr_data.decode()}")
-
-    return image
-
-
-async def i_frame_to_jpeg(frame: bytes, ffmpeg: str = "ffmpeg") -> bytes:
-    """Convert a i-frame from a Reolink stream to a JPEG image"""
-    return await asyncio.shield(_i_frame_to_jpeg_shielded(frame, ffmpeg))
 
 
 def pretty_xml(content: str) -> str:

@@ -47,6 +47,8 @@ UDP_RESEND_TIMEOUT = 1.0  # seconds, resend a packet if no ACK is received withi
 UDP_MAX_RESENDS = 3  # number of resends after a timeout before giving up
 UDP_RESEND_MIN_INTERVAL = 0.1  # seconds, minimal time between resends of a packet requested by ACKs
 UDP_SEND_WINDOW = 10  # maximum number of send packets waiting on an ACK, the camera drops packets if too many are send at once
+UDP_CON_RESEND_INTERVAL = 0.5  # seconds, resend a UDP connection message (C2D_S/C2D_C) if no response is received within this time
+UDP_CON_TIMEOUT = 10  # seconds, give up on a UDP connection message (C2D_S/C2D_C) if no response is received within this time
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -210,7 +212,7 @@ class BaichuanUdpConnection(BaichuanBaseConnection):
         for cmd_id, full_mess_id in dropped_mess:
             if cmd_id is None or full_mess_id is None:
                 continue
-            if (receive_future := self.receive_futures.get(cmd_id, {}).get(full_mess_id)) is not None and not receive_future.done():
+            if (receive_future := self.receive_futures.get((cmd_id, full_mess_id))) is not None and not receive_future.done():
                 receive_future.set_exception(ReolinkTimeoutSendACK(f"Baichuan host {self._host}: Timeout waiting on send ACK of seq_id {seq_id} cmd_id {cmd_id}"))
 
     def _clear_send_buffer(self) -> None:
@@ -279,14 +281,14 @@ class BaichuanUdpConnection(BaichuanBaseConnection):
 
         return bytes.fromhex(MAGIC_UDP_BC) + host_id_bytes + bytes.fromhex("00000000") + mess_id_bytes + mess_len_bytes
 
-    async def _send(self, data: bytes, cmd_id: int, full_mess_id: int, channel: int | None = None, log_mess: str = "") -> send_response_t:
+    async def _send(self, data: bytes, cmd_id: int, full_mess_id: int, channel: int | None = None, log_mess: str = "", timeout: int | float = TIMEOUT) -> send_response_t:
         """Send a message and wait for the response"""
-        return await super().send(data, cmd_id, full_mess_id, channel, log_mess)
+        return await super().send(data, cmd_id, full_mess_id, channel, log_mess, timeout)
 
-    async def send(self, data: bytes, cmd_id: int, full_mess_id: int, channel: int | None = None, log_mess: str = "") -> send_response_t:
+    async def send(self, data: bytes, cmd_id: int, full_mess_id: int, channel: int | None = None, log_mess: str = "", timeout: int | float = TIMEOUT) -> send_response_t:
         """Wrap the BC message in a UDP header, send the message and wait for the response"""
         udp_header = await self._construct_udp_header(len(data))
-        return await self._send(udp_header + data, cmd_id, full_mess_id, channel, log_mess)
+        return await self._send(udp_header + data, cmd_id, full_mess_id, channel, log_mess, timeout)
 
     async def send_without_wait(self, data: bytes, cmd_id: int | None = None, timeout: int | float = TIMEOUT) -> None:
         """Wrap the BC message in a UDP header, send a message without waiting"""
@@ -311,11 +313,25 @@ class BaichuanUdpConnection(BaichuanBaseConnection):
         cmd_id = -1
         log_mess = f"Baichuan host {self._host}:{self._local_port}>{self._port}: send UDP message: {body}"
 
-        recv_payload, _, _ = await self._send(mess, cmd_id, trans_id, log_mess=log_mess)
+        # UDP connection messages are not acknowledged, resend them untill a response is received
+        resend_task = self._loop.create_task(self._resend_udp_con(mess, trans_id))
+        try:
+            recv_payload, _, _ = await self._send(mess, cmd_id, trans_id, log_mess=log_mess, timeout=UDP_CON_TIMEOUT)
+        finally:
+            resend_task.cancel()
         recv_mess = recv_payload.decode("utf8")
         if _LOGGER.isEnabledFor(logging.DEBUG):
             _LOGGER.debug("Baichuan host %s:%s<%s: received UDP message:\n%s", self._host, self._local_port, self._port, pretty_xml(recv_mess))
         return recv_mess
+
+    async def _resend_udp_con(self, mess: bytes, trans_id: int) -> None:
+        """Periodically resend a UDP connection message"""
+        while True:
+            await asyncio.sleep(UDP_CON_RESEND_INTERVAL)
+            if self._transport is None:
+                return
+            _LOGGER.debug("Baichuan host %s: no response on UDP connection message with mess_id %s, resending", self._host, trans_id)
+            self._transport.sendto(mess, (self._host, self._port))
 
     @property
     def udp_connected(self) -> bool:
@@ -559,7 +575,7 @@ class BaichuanUdpClientProtocol(BaichuanBaseClientProtocol, asyncio.DatagramProt
         self._udp_data = self._udp_data[mess_len::]
 
         # extract receive future
-        receive_future = self.receive_futures.get(-1, {}).get(rec_mess_id)
+        receive_future = self.receive_futures.get((-1, rec_mess_id))
 
         try:
             # check the checksum
@@ -588,6 +604,7 @@ class BaichuanUdpClientProtocol(BaichuanBaseClientProtocol, asyncio.DatagramProt
                     if _LOGGER.isEnabledFor(logging.DEBUG):
                         _LOGGER.debug("Baichuan host %s: received unknown UDP connection message with mess_id %s, dropping:\n%s", self._host, rec_mess_id, pretty_xml(mess))
                     return
+                udp_futures = {mess_id: future for (cmd_id, mess_id), future in self.receive_futures.items() if cmd_id == -1}
                 for child in root:
                     if child.tag == "D2C_C_R":
                         if _LOGGER.isEnabledFor(logging.DEBUG):
@@ -596,9 +613,8 @@ class BaichuanUdpClientProtocol(BaichuanBaseClientProtocol, asyncio.DatagramProt
                         if _LOGGER.isEnabledFor(logging.DEBUG):
                             _LOGGER.debug("Baichuan host %s: received UDP disconnect message with mess_id %s:\n%s", self._host, rec_mess_id, pretty_xml(mess))
                         self._loop.create_task(self.drop_coroutine)
-                    elif child.tag == "D2C_S_R" and len(self.receive_futures.get(-1, {})) == 1 and receive_future is None:
-                        exp_mess_id = next(iter(self.receive_futures[-1].keys()))
-                        receive_future = self.receive_futures.get(-1, {}).get(exp_mess_id)
+                    elif child.tag == "D2C_S_R" and len(udp_futures) == 1 and receive_future is None:
+                        exp_mess_id, receive_future = next(iter(udp_futures.items()))
                         _LOGGER.debug(
                             "Baichuan host %s: received UDP D2C_S_R with mess_id %s, while expecting mess_id %s, "
                             "likely the camera is entering sleep mode or there already is a second connection, "
@@ -608,7 +624,7 @@ class BaichuanUdpClientProtocol(BaichuanBaseClientProtocol, asyncio.DatagramProt
                             exp_mess_id,
                         )
                     else:
-                        if mess_ids := list(self.receive_futures.get(-1, {}).keys()):
+                        if mess_ids := list(udp_futures.keys()):
                             if _LOGGER.isEnabledFor(logging.DEBUG):
                                 _LOGGER.debug(
                                     "Baichuan host %s: received unknown UDP connection message with mess_id %s, while waiting on mess_id %s dropping:\n%s",

@@ -23,7 +23,7 @@ from zipfile import ZipFile
 
 import aiohttp
 from aiortsp.rtsp.connection import RTSPConnection  # type: ignore
-from aiortsp.rtsp.errors import RTSPError  # type: ignore
+from aiortsp.rtsp.errors import RTSPError, RTSPResponseError  # type: ignore
 from orjson import JSONDecodeError  # pylint: disable=no-name-in-module
 from orjson import dumps as json_dumps  # pylint: disable=no-name-in-module
 from orjson import loads as json_loads  # pylint: disable=no-name-in-module
@@ -89,6 +89,7 @@ MANUFACTURER = "Reolink"
 DEFAULT_STREAM = "sub"
 DEFAULT_PROTOCOL = "rtmp"
 DEFAULT_TIMEOUT = 30  # seconds
+SOCK_CONNECT_TIMEOUT = 10  # seconds, give up opening the TCP connection of a HTTP(s) request if it is not established within this time
 RETRY_ATTEMPTS = 3
 MAX_CHUNK_ITEMS = 35
 DEFAULT_RTMP_AUTH_METHOD = "PASSWORD"
@@ -182,7 +183,7 @@ class Host:
         self._token: Optional[str] = None
         self._lease_time: Optional[datetime] = None
         # Connection session
-        self._timeout: aiohttp.ClientTimeout = aiohttp.ClientTimeout(total=timeout, connect=timeout, sock_connect=timeout, sock_read=timeout)
+        self._timeout: aiohttp.ClientTimeout = aiohttp.ClientTimeout(total=timeout, connect=timeout, sock_connect=min(timeout, SOCK_CONNECT_TIMEOUT), sock_read=timeout)
         self._aiohttp_session_internall: bool = True
         if aiohttp_get_session_callback is not None:
             self._get_aiohttp_session = aiohttp_get_session_callback
@@ -255,6 +256,7 @@ class Host:
         self._rtsp_mainStream: dict[int, str] = {}
         self._rtsp_subStream: dict[int, str] = {}
         self._rtsp_verified: dict[int, dict[str, str]] = {}
+        self._rtsp_backchannel: dict[int, bool] = {}
 
         ##############################################################################
         # Presets
@@ -1429,31 +1431,14 @@ class Host:
         original_port = self._port
         original_https = self._use_https
 
-        # try HTTPs port
-        first_exc = None
-        self._port = 443
-        self.enable_https(True)
-        try:
-            await self.login()
-            return
-        except LoginError as exc:
-            first_exc = exc
-
-        # try HTTP port
-        self._port = 80
-        self.enable_https(False)
-        try:
-            await self.login()
-            return
-        except LoginError:
-            pass
-
         # check if HTTP(s) API is supported
+        baichuan_available = True
         try:
-            await self.baichuan.get_host_data()
+            await self.baichuan.get_abilities()
         except (CredentialsInvalidError, LoginAccountDeviceError):
             raise
         except ReolinkError as exc:
+            baichuan_available = False
             _LOGGER.debug("%s, can not check if HTTP api is supported", exc)
         if self.baichuan_only:
             self._port = None
@@ -1461,14 +1446,41 @@ class Host:
             return
 
         # see which ports are enabled using baichuan protocol on port 9000
-        try:
-            await self.baichuan.get_ports()
-        except (CredentialsInvalidError, LoginAccountDeviceError):
-            raise
-        except ReolinkError as exc:
-            _LOGGER.debug(exc)
-            # Raise original exception instead of the retry fallback exception
-            raise first_exc from exc
+        if baichuan_available:
+            try:
+                await self.baichuan.get_ports()
+            except (CredentialsInvalidError, LoginAccountDeviceError):
+                raise
+            except ReolinkError as exc:
+                baichuan_available = False
+                _LOGGER.debug(exc)
+
+        # If there are HTTP(s) ports enabled, try them.
+        ports_to_try: list[tuple[int, bool]] = []
+        if baichuan_available:
+            if self.baichuan.https_enabled:
+                ports_to_try.append((self.baichuan.https_port or 443, True))
+            if self.baichuan.http_enabled:
+                ports_to_try.append((self.baichuan.http_port or 80, False))
+        if not baichuan_available or (self.baichuan.https_enabled is None and self.baichuan.http_enabled is None):
+            ports_to_try.extend([(443, True), (80, False)])
+
+        first_exc: LoginError | None = None
+        for port, https in ports_to_try:
+            self._port = port
+            self.enable_https(https)
+            try:
+                await self.login()
+                return
+            except LoginError as exc:
+                if first_exc is None:
+                    first_exc = exc
+
+        if first_exc is None:
+            first_exc = LoginError(f"HTTP(s) ports not enabled on host '{self._host}'")
+        if not baichuan_available:
+            # can not open ports without the baichuan protocol
+            raise first_exc
 
         # check privacy mode
         try:
@@ -1502,11 +1514,11 @@ class Host:
             # give the camera some time to startup the HTTP API server
             await asyncio.sleep(5)
 
-        if self.baichuan.https_enabled and self.baichuan.https_port is not None:
-            self._port = self.baichuan.https_port
+        if self.baichuan.https_enabled:
+            self._port = self.baichuan.https_port or 443
             self.enable_https(True)
-        elif self.baichuan.http_enabled and self.baichuan.http_port is not None:
-            self._port = self.baichuan.http_port
+        elif self.baichuan.http_enabled:
+            self._port = self.baichuan.http_port or 80
             self.enable_https(False)
         else:
             raise LoginError(f"Failed to open HTTPs port on host '{self._host}' using baichuan, altough no errors returned by API") from first_exc
@@ -2691,6 +2703,13 @@ class Host:
                     await self.get_rtsp_stream_source(channel, "main")
                     if self.supported(channel, "autotrack_stream"):
                         await self.get_rtsp_stream_source(channel, "autotrack_main")
+                # Check two way audio support from the RTSP describe response
+                if self._rtsp_backchannel.get(channel, True) and (
+                    self.api_version("talk", channel) > 0
+                    or self.baichuan.api_version("ipcAudioTalk", channel) > 0
+                    or (not self.is_nvr and self.baichuan.api_version("audioTalk") > 0)
+                ):
+                    self._add_capability("two_way_audio", channel)
 
         self._startup = False
 
@@ -2989,6 +3008,7 @@ class Host:
         if None in ch_list and self.supported(None, "update"):
             body = [{"cmd": "CheckFirmware"}]
 
+            self._new_online_firmware = 0
             try:
                 async with asyncio.timeout(15):
                     json_data = await self.send(body, expected_response_type="json")
@@ -3457,9 +3477,21 @@ class Host:
 
         url_clean = url.replace(f"{self._username}:{self._enc_password}@", "")
 
+        backchannel: bool | None = None
         try:
             async with RTSPConnection(host=self._host, port=self._rtsp_port, username=self._username, password=self._password, logger=_LOGGER_RTSP) as rtsp_conn:
-                response = await rtsp_conn.send_request("DESCRIBE", url_clean)
+                if channel not in self._rtsp_backchannel:
+                    # Also check if the camera supports a ONVIF audio backchannel (two way audio over RTSP)
+                    try:
+                        response = await rtsp_conn.send_request("DESCRIBE", url_clean, headers={"Require": "www.onvif.org/ver20/backchannel"})
+                    except RTSPResponseError as err:
+                        _LOGGER.debug("RTSP url '%s' did not accept the backchannel Require header, retrying without: %s", url_clean, err)
+                        backchannel = False
+                        response = await rtsp_conn.send_request("DESCRIBE", url_clean)
+                    else:
+                        backchannel = b"a=sendonly" in response.data
+                else:
+                    response = await rtsp_conn.send_request("DESCRIBE", url_clean)
         except RTSPError as err:
             _LOGGER.debug("Error while checking RTSP url '%s': %s", url_clean, err)
             return False
@@ -3467,6 +3499,10 @@ class Host:
         if response.status != 200 or response.status_msg != "OK":
             _LOGGER.debug("Error while checking RTSP url '%s': status %s, message %s", url_clean, response.status, response.status_msg)
             return False
+
+        # only store the backchannel result once the URL itself is verified to work
+        if backchannel is not None:
+            self._rtsp_backchannel[channel] = backchannel
 
         self._rtsp_verified[channel][stream] = url
         return True
@@ -6184,6 +6220,8 @@ class Host:
 
         if not is_login_logout:
             await self._login_open_port()
+            if self.baichuan_only:  # another check needed in case this is the first command
+                return await self._baichuan_alternative(body, expected_response_type)
 
         if not param:
             param = {}
